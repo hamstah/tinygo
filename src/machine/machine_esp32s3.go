@@ -424,14 +424,26 @@ const (
 	uartFIFOSize = 128
 )
 
+type uartRegisterSet struct {
+	gpioMatrixSignal uint32
+}
+
 func (uart *UART) Configure(config UARTConfig) {
 	if config.BaudRate == 0 {
 		config.BaudRate = 115200
 	}
-	uart.configure(config)
+
+	switch {
+	case uart.Bus == esp.UART0:
+		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 12})
+	case uart.Bus == esp.UART1:
+		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 15})
+	case uart.Bus == esp.UART2:
+		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 18})
+	}
 }
 
-func (uart *UART) configure(config UARTConfig) {
+func (uart *UART) configure(config UARTConfig, regs uartRegisterSet) {
 	initUARTClock(uart.Bus)
 
 	uart.Bus.SetCLK_CONF_TX_SCLK_EN(0)
@@ -459,6 +471,7 @@ func (uart *UART) configure(config UARTConfig) {
 
 	uart.Bus.SetID_REG_UPDATE(1)
 
+	uart.setupPins(config, regs)
 	uart.enableTransmitter()
 	uart.enableReceiver()
 
@@ -528,6 +541,16 @@ func initUARTClock(bus *esp.UART_Type) {
 	bus.SetID_REG_UPDATE(0)
 	esp.RTC_CNTL.SetCLK_CONF_DIG_CLK8M_EN(1)
 	for bus.GetID_REG_UPDATE() > 0 {
+	}
+}
+
+func (uart *UART) setupPins(config UARTConfig, regs uartRegisterSet) {
+	pinsSpecified := config.TX != 0 || config.RX != 0
+	if pinsSpecified && config.TX != NoPin {
+		config.TX.configure(PinConfig{Mode: PinOutput}, regs.gpioMatrixSignal)
+	}
+	if pinsSpecified && config.RX != NoPin {
+		config.RX.configure(PinConfig{Mode: PinInputPullup}, regs.gpioMatrixSignal)
 	}
 }
 
