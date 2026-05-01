@@ -412,8 +412,11 @@ var (
 )
 
 type UART struct {
-	Bus    *esp.UART_Type
-	Buffer *RingBuffer
+	Bus                  *esp.UART_Type
+	Buffer               *RingBuffer
+	ParityErrorDetected  bool // set when parity error detected
+	DataErrorDetected    bool // set when data corruption detected
+	DataOverflowDetected bool // set when data overflow detected in UART FIFO buffer or RingBuffer
 }
 
 const (
@@ -421,10 +424,20 @@ const (
 	defaultStopBit  = 1
 	defaultParity   = ParityNone
 
-	uartFIFOSize = 128
+	uartInterrupts = esp.UART_INT_ENA_RXFIFO_FULL_INT_ENA |
+		esp.UART_INT_ENA_PARITY_ERR_INT_ENA |
+		esp.UART_INT_ENA_FRM_ERR_INT_ENA |
+		esp.UART_INT_ENA_RXFIFO_OVF_INT_ENA |
+		esp.UART_INT_ENA_GLITCH_DET_INT_ENA
+
+	uartCPUInterrupt = 7
+	uartFIFOSize     = 128
 )
 
+var onceUart sync.Once
+
 type uartRegisterSet struct {
+	interruptMapReg  *volatile.Register32
 	gpioMatrixSignal uint32
 }
 
@@ -435,11 +448,20 @@ func (uart *UART) Configure(config UARTConfig) {
 
 	switch {
 	case uart.Bus == esp.UART0:
-		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 12})
+		uart.configure(config, uartRegisterSet{
+			interruptMapReg:  &esp.INTERRUPT_CORE0.UART_INTR_MAP,
+			gpioMatrixSignal: 12,
+		})
 	case uart.Bus == esp.UART1:
-		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 15})
+		uart.configure(config, uartRegisterSet{
+			interruptMapReg:  &esp.INTERRUPT_CORE0.UART1_INTR_MAP,
+			gpioMatrixSignal: 15,
+		})
 	case uart.Bus == esp.UART2:
-		uart.configure(config, uartRegisterSet{gpioMatrixSignal: 18})
+		uart.configure(config, uartRegisterSet{
+			interruptMapReg:  &esp.INTERRUPT_CORE0.UART2_INTR_MAP,
+			gpioMatrixSignal: 18,
+		})
 	}
 }
 
@@ -472,6 +494,7 @@ func (uart *UART) configure(config UARTConfig, regs uartRegisterSet) {
 	uart.Bus.SetID_REG_UPDATE(1)
 
 	uart.setupPins(config, regs)
+	uart.configureInterrupt(regs.interruptMapReg)
 	uart.enableTransmitter()
 	uart.enableReceiver()
 
@@ -554,6 +577,53 @@ func (uart *UART) setupPins(config UARTConfig, regs uartRegisterSet) {
 	}
 }
 
+func (uart *UART) configureInterrupt(intrMapReg *volatile.Register32) {
+	uart.Bus.INT_ENA.ClearBits(uartInterrupts)
+
+	intrMapReg.Set(uartCPUInterrupt)
+	onceUart.Do(func() {
+		_ = interrupt.New(uartCPUInterrupt, func(i interrupt.Interrupt) {
+			UART0.serveInterrupt()
+			UART1.serveInterrupt()
+			UART2.serveInterrupt()
+		}).Enable()
+	})
+}
+
+func (uart *UART) serveInterrupt() {
+	interruptFlag := uart.Bus.INT_ST.Get()
+	if interruptFlag&uartInterrupts == 0 {
+		return
+	}
+
+	uart.Bus.INT_ENA.ClearBits(uartInterrupts)
+
+	if interruptFlag&esp.UART_INT_ENA_RXFIFO_FULL_INT_ENA != 0 {
+		for uart.Bus.GetSTATUS_RXFIFO_CNT() > 0 {
+			b := uart.Bus.GetFIFO_RXFIFO_RD_BYTE()
+			if !uart.Buffer.Put(byte(b & 0xff)) {
+				uart.DataOverflowDetected = true
+			}
+		}
+	}
+	if interruptFlag&esp.UART_INT_ENA_PARITY_ERR_INT_ENA != 0 {
+		uart.ParityErrorDetected = true
+	}
+	if interruptFlag&esp.UART_INT_ENA_FRM_ERR_INT_ENA != 0 {
+		uart.DataErrorDetected = true
+	}
+	if interruptFlag&esp.UART_INT_ENA_RXFIFO_OVF_INT_ENA != 0 {
+		uart.DataOverflowDetected = true
+	}
+	if interruptFlag&esp.UART_INT_ENA_GLITCH_DET_INT_ENA != 0 {
+		uart.DataErrorDetected = true
+	}
+
+	uart.Bus.INT_CLR.SetBits(interruptFlag)
+	uart.Bus.INT_CLR.ClearBits(interruptFlag)
+	uart.Bus.INT_ENA.SetBits(uartInterrupts)
+}
+
 func (uart *UART) enableTransmitter() {
 	uart.Bus.SetCONF0_TXFIFO_RST(1)
 	uart.Bus.SetCONF0_TXFIFO_RST(0)
@@ -564,6 +634,11 @@ func (uart *UART) enableReceiver() {
 	uart.Bus.SetCONF0_RXFIFO_RST(1)
 	uart.Bus.SetCONF0_RXFIFO_RST(0)
 	uart.Bus.SetCONF1_RXFIFO_FULL_THRHD(1)
+	uart.Bus.SetINT_ENA_RXFIFO_FULL_INT_ENA(1)
+	uart.Bus.SetINT_ENA_FRM_ERR_INT_ENA(1)
+	uart.Bus.SetINT_ENA_PARITY_ERR_INT_ENA(1)
+	uart.Bus.SetINT_ENA_GLITCH_DET_INT_ENA(1)
+	uart.Bus.SetINT_ENA_RXFIFO_OVF_INT_ENA(1)
 }
 
 func (uart *UART) writeByte(b byte) error {
