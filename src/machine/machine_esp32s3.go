@@ -428,8 +428,42 @@ func (uart *UART) Configure(config UARTConfig) {
 	if config.BaudRate == 0 {
 		config.BaudRate = 115200
 	}
+	uart.configure(config)
+}
+
+func (uart *UART) configure(config UARTConfig) {
+	initUARTClock(uart.Bus)
+
+	uart.Bus.SetCLK_CONF_TX_SCLK_EN(0)
+	uart.Bus.SetCLK_CONF_RX_SCLK_EN(0)
+
+	// ESP32-S3 UART SCLK_SEL values are 1=APB, 2=RTC, 3=XTAL.
+	uart.Bus.SetCLK_CONF_SCLK_SEL(1)
+	uart.Bus.SetCLK_CONF_SCLK_DIV_NUM(0)
+	uart.Bus.SetCLK_CONF_SCLK_DIV_A(0)
+	uart.Bus.SetCLK_CONF_SCLK_DIV_B(0)
+
 	uart.SetBaudRate(config.BaudRate)
 	_ = uart.SetFormat(defaultDataBits, defaultStopBit, defaultParity)
+
+	uart.Bus.SetRS485_CONF_RS485_EN(0)
+	uart.Bus.SetRS485_CONF_RS485TX_RX_EN(0)
+	uart.Bus.SetRS485_CONF_RS485RXBY_TX_EN(0)
+	uart.Bus.SetCONF0_IRDA_EN(0)
+	uart.Bus.SetCONF0_TX_FLOW_EN(0)
+	uart.Bus.SetCONF1_RX_FLOW_EN(0)
+	uart.Bus.SetCONF0_CLK_EN(1)
+	uart.Bus.SetCONF0_MEM_CLK_EN(1)
+	uart.Bus.SetMEM_CONF_MEM_FORCE_PD(0)
+	uart.Bus.SetMEM_CONF_MEM_FORCE_PU(1)
+
+	uart.Bus.SetID_REG_UPDATE(1)
+
+	uart.enableTransmitter()
+	uart.enableReceiver()
+
+	uart.Bus.SetCLK_CONF_TX_SCLK_EN(1)
+	uart.Bus.SetCLK_CONF_RX_SCLK_EN(1)
 }
 
 func (uart *UART) SetBaudRate(baudRate uint32) {
@@ -461,6 +495,52 @@ func (uart *UART) SetFormat(dataBits, stopBits int, parity UARTParity) error {
 		uart.Bus.SetCONF0_PARITY(1)
 	}
 	return nil
+}
+
+func initUARTClock(bus *esp.UART_Type) {
+	esp.SYSTEM.SetPERIP_CLK_EN0_UART_MEM_CLK_EN(1)
+	esp.SYSTEM.SetPERIP_RST_EN0_UART_MEM_RST(0)
+
+	// ESP32-S3 keeps UART2 clock/reset controls in PERIP_*_EN1, unlike
+	// UART0/UART1. Hold RST_CORE during the peripheral reset sequence, matching
+	// ESP-IDF's UART LL reset workaround for avoiding a garbage TX level.
+	switch bus {
+	case esp.UART0:
+		esp.SYSTEM.SetPERIP_CLK_EN0_UART_CLK_EN(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART_RST(0)
+		bus.SetCLK_CONF_RST_CORE(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART_RST(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART_RST(0)
+	case esp.UART1:
+		esp.SYSTEM.SetPERIP_CLK_EN0_UART1_CLK_EN(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART1_RST(0)
+		bus.SetCLK_CONF_RST_CORE(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART1_RST(1)
+		esp.SYSTEM.SetPERIP_RST_EN0_UART1_RST(0)
+	case esp.UART2:
+		esp.SYSTEM.SetPERIP_CLK_EN1_UART2_CLK_EN(1)
+		esp.SYSTEM.SetPERIP_RST_EN1_UART2_RST(0)
+		bus.SetCLK_CONF_RST_CORE(1)
+		esp.SYSTEM.SetPERIP_RST_EN1_UART2_RST(1)
+		esp.SYSTEM.SetPERIP_RST_EN1_UART2_RST(0)
+	}
+	bus.SetCLK_CONF_RST_CORE(0)
+	bus.SetID_REG_UPDATE(0)
+	esp.RTC_CNTL.SetCLK_CONF_DIG_CLK8M_EN(1)
+	for bus.GetID_REG_UPDATE() > 0 {
+	}
+}
+
+func (uart *UART) enableTransmitter() {
+	uart.Bus.SetCONF0_TXFIFO_RST(1)
+	uart.Bus.SetCONF0_TXFIFO_RST(0)
+	uart.Bus.SetCONF1_TXFIFO_EMPTY_THRHD(10)
+}
+
+func (uart *UART) enableReceiver() {
+	uart.Bus.SetCONF0_RXFIFO_RST(1)
+	uart.Bus.SetCONF0_RXFIFO_RST(0)
+	uart.Bus.SetCONF1_RXFIFO_FULL_THRHD(1)
 }
 
 func (uart *UART) writeByte(b byte) error {
