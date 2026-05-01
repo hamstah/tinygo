@@ -416,16 +416,55 @@ type UART struct {
 	Buffer *RingBuffer
 }
 
+const (
+	defaultDataBits = 8
+	defaultStopBit  = 1
+	defaultParity   = ParityNone
+
+	uartFIFOSize = 128
+)
+
 func (uart *UART) Configure(config UARTConfig) {
 	if config.BaudRate == 0 {
 		config.BaudRate = 115200
 	}
-	// Crystal clock source is selected by default
-	uart.Bus.CLKDIV.Set(xtalClock / config.BaudRate)
+	uart.SetBaudRate(config.BaudRate)
+	_ = uart.SetFormat(defaultDataBits, defaultStopBit, defaultParity)
+}
+
+func (uart *UART) SetBaudRate(baudRate uint32) {
+	maxDiv := uint32((1 << 12) - 1)
+	sclkDiv := (apbClock + (maxDiv * baudRate) - 1) / (maxDiv * baudRate)
+	clkDiv := (apbClock << 4) / (baudRate * sclkDiv)
+	uart.Bus.SetCLKDIV(clkDiv >> 4)
+	uart.Bus.SetCLKDIV_FRAG(clkDiv & 0xf)
+	uart.Bus.SetCLK_CONF_SCLK_DIV_NUM(sclkDiv - 1)
+}
+
+func (uart *UART) SetFormat(dataBits, stopBits int, parity UARTParity) error {
+	if dataBits < 5 {
+		return errors.New("UART: invalid data size")
+	}
+	if stopBits > 1 {
+		return errors.New("UART: invalid bit size")
+	}
+	uart.Bus.SetCONF0_BIT_NUM(uint32(dataBits - 5))
+	uart.Bus.SetCONF0_STOP_BIT_NUM(uint32(stopBits))
+	switch parity {
+	case ParityNone:
+		uart.Bus.SetCONF0_PARITY_EN(0)
+	case ParityEven:
+		uart.Bus.SetCONF0_PARITY_EN(1)
+		uart.Bus.SetCONF0_PARITY(0)
+	case ParityOdd:
+		uart.Bus.SetCONF0_PARITY_EN(1)
+		uart.Bus.SetCONF0_PARITY(1)
+	}
+	return nil
 }
 
 func (uart *UART) writeByte(b byte) error {
-	for (uart.Bus.STATUS.Get()>>16)&0xff >= 128 {
+	for (uart.Bus.STATUS.Get()>>16)&0xff >= uartFIFOSize {
 		// Read UART_TXFIFO_CNT from the status register, which indicates how
 		// many bytes there are in the transmit buffer. Wait until there are
 		// less than 128 bytes in this buffer (the default buffer size).
